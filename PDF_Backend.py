@@ -1,9 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 import numpy as np
+import psutil
 from dotenv import load_dotenv
 from astrapy import DataAPIClient
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -12,9 +13,7 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_huggingface import HuggingFaceEmbeddings
 
-# =========================
-# 1️⃣ Load environment variables
-# =========================
+# ----------- Load ENV Variables -----------
 load_dotenv()
 os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN_RAG")
 os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_KEY_RAG")
@@ -23,9 +22,7 @@ ASTRA_API_TOKEN = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
 ASTRA_ENDPOINT = os.getenv("ASTRA_VECTOR_DB_ENDPOINT")
 ASTRA_TABLE = "qa_sih_demo"
 
-# =========================
-# 2️⃣ FastAPI setup
-# =========================
+# ----------- FastAPI Setup -----------
 app = FastAPI(title="⛑️ Mine Survival Assistant API")
 app.add_middleware(
     CORSMiddleware,
@@ -35,10 +32,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# 3️⃣ Astra DB connection (lazy fail-safe)
-# =========================
+# ----------- Global Variables -----------
 collection = None
+chat_histories = {}
+embedding_model = None
+llm = None
+
+# ----------- Astra DB Connection -----------
 try:
     if not ASTRA_API_TOKEN or not ASTRA_ENDPOINT:
         raise ValueError("Missing Astra DB credentials in .env file")
@@ -51,54 +51,33 @@ except Exception as e:
     print(f"❌ Failed to connect to Astra DB: {e}")
     collection = None
 
-# =========================
-# 4️⃣ Lazy-loaded embeddings & LLM
-# =========================
-embedding_model = None
-llm = None
+# ----------- Request Model -----------
+class AskRequest(BaseModel):
+    session_id: str
+    question: str
 
+# ----------- Helper Functions -----------
 def get_embedding_model():
     global embedding_model
     if embedding_model is None:
-        print("🔄 Loading HuggingFace Embeddings...")
         embedding_model = HuggingFaceEmbeddings(model="all-MiniLM-L6-v2")
     return embedding_model
 
 def get_llm():
     global llm
     if llm is None:
-        print("🔄 Loading Gemini LLM...")
         llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
     return llm
 
-chat_histories = {}  # session_id → ChatMessageHistory
-
-
-# =========================
-# 5️⃣ API Models
-# =========================
-class AskRequest(BaseModel):
-    session_id: str
-    question: str
-
-
-# =========================
-# 6️⃣ Cosine similarity helper
-# =========================
 def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-
-# =========================
-# 7️⃣ Safe top-k vector search (lowered memory usage)
-# =========================
-def get_top_docs(query, k=3, limit=100):
+def get_top_docs(query, k=3, limit=1000):
     if collection is None:
         return []
 
     query_vector = np.array(get_embedding_model().embed_query(query))
     try:
-        # ✅ Lower limit reduces memory usage
         all_docs = collection.find({}, limit=limit)
     except Exception as e:
         print(f"❌ Astra query failed: {e}")
@@ -116,30 +95,33 @@ def get_top_docs(query, k=3, limit=100):
     scores.sort(reverse=True, key=lambda x: x[0])
     return [doc for sim, doc in scores[:k]]
 
+# ----------- Middleware for Memory Logging -----------
+@app.middleware("http")
+async def log_memory_usage(request: Request, call_next):
+    response = await call_next(request)
+    mem = psutil.Process().memory_info().rss / 1024 / 1024
+    print(f"📊 Memory usage: {mem:.2f} MB")
+    return response
 
-# =========================
-# 8️⃣ Health check
-# =========================
+# ----------- Routes -----------
+@app.get("/")
+def root():
+    return {"status": "running", "message": "⛑️ Mine Survival Assistant API is up and healthy!"}
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-
-# =========================
-# 9️⃣ Ask endpoint
-# =========================
 @app.post("/ask")
 async def ask_question(req: AskRequest):
     try:
         session_id = req.session_id
         question = req.question
 
-        # Initialize chat history for new session
         if session_id not in chat_histories:
             chat_histories[session_id] = ChatMessageHistory()
         history = chat_histories[session_id]
 
-        # Get top documents
         top_docs = get_top_docs(question, k=3)
         if not top_docs:
             return JSONResponse(
@@ -149,7 +131,6 @@ async def ask_question(req: AskRequest):
 
         context_text = "\n\n".join([doc.get("body_blob", "") for doc in top_docs])
 
-        # Prepare system prompt
         system_prompt = (
             "⚠️ You are a Mine Disaster Survival Assistant. "
             "Always respond with clear, step-by-step survival guidance for trapped miners. "
@@ -162,8 +143,8 @@ async def ask_question(req: AskRequest):
             MessagesPlaceholder("chat_history"),
             ("human", "{input}")
         ])
-
         question_answer_chain = qa_prompt | get_llm()
+
         conversational_chain = RunnableWithMessageHistory(
             question_answer_chain,
             lambda _: history,
@@ -185,10 +166,6 @@ async def ask_question(req: AskRequest):
             status_code=500
         )
 
-
-# =========================
-# 10️⃣ Run server
-# =========================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
